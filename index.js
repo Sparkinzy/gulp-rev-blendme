@@ -9,7 +9,7 @@ const modifyFilename = require('modify-filename');
 const Vinyl = require('vinyl');
 const PluginError = require('plugin-error');
 
-function relativePath(base, filePath) {
+function relPath(base, filePath) {
 	filePath = filePath.replace(/\\/g, '/');
 	base = base.replace(/\\/g, '/');
 
@@ -34,56 +34,61 @@ function transformFilename(file) {
 
 	file.path = modifyFilename(file.path, (filename, extension) => {
 		const extIndex = filename.lastIndexOf('.');
-
+		const revHash = file.revHash;
 		filename = extIndex === -1 ?
-			revPath(filename, file.revHash) :
-			revPath(filename.slice(0, extIndex), file.revHash) + filename.slice(extIndex);
+			revPath(filename, revHash) :
+			revPath(filename.slice(0, extIndex), revHash) + filename.slice(extIndex);
 
 		return filename + extension;
 	});
 }
 
-const getManifestFile = async options => {
-	try {
-		return await vinylFile.read(options.path, options);
-	} catch (error) {
-		if (error.code === 'ENOENT') {
-			return new Vinyl(options);
-		}
-
-		throw error;
+const getManifestFile = opts => vinylFile.read(opts.path, opts).catch(error => {
+	if (error.code === 'ENOENT') {
+		return new Vinyl(opts);
 	}
-};
 
-const plugin = () => {
+	throw error;
+});
+
+const plugin = (opts) => {
 	const sourcemaps = [];
 	const pathMap = {};
 
-	return through.obj((file, encoding, callback) => {
+	opts = Object.assign({
+		append: true
+	}, opts);
+
+	return through.obj((file, enc, cb) => {
 		if (file.isNull()) {
-			callback(null, file);
+			cb(null, file);
 			return;
 		}
 
 		if (file.isStream()) {
-			callback(new PluginError('gulp-rev', 'Streaming not supported'));
+			cb(new PluginError('gulp-rev', 'Streaming not supported'));
 			return;
 		}
 
 		// This is a sourcemap, hold until the end
 		if (path.extname(file.path) === '.map') {
 			sourcemaps.push(file);
-			callback();
+			cb();
 			return;
 		}
 
 		const oldPath = file.path;
 		transformFilename(file);
 		pathMap[oldPath] = file.revHash;
+		if (opts.appCodeName){
+			// 仅保留文件名，文件名中不加hash
+			file.path = revPath.revert(file.path,file.revHash);
+		}
 
-		callback(null, file);
-	}, function (callback) {
-		for (const file of sourcemaps) {
+
+		cb(null, file);
+	}, function (cb) {
+		sourcemaps.forEach(file => {
 			let reverseFilename;
 
 			// Attempt to parse the sourcemap's JSON to get the reverse filename
@@ -107,68 +112,67 @@ const plugin = () => {
 			}
 
 			this.push(file);
-		}
+		});
 
-		callback();
+		cb();
 	});
 };
 
-plugin.manifest = (path_, options) => {
-	if (typeof path_ === 'string') {
-		path_ = {path: path_};
+plugin.manifest = (pth, opts) => {
+	if (typeof pth === 'string') {
+		pth = {path: pth};
 	}
 
-	options = {
+	opts = Object.assign({
 		path: 'rev-manifest.json',
 		merge: false,
 		transformer: JSON,
-		...options,
-		...path_
-	};
+		append: true
+	}, opts, pth);
 
 	let manifest = {};
 
-	return through.obj((file, encoding, callback) => {
+	return through.obj((file, enc, cb) => {
 		// Ignore all non-rev'd files
 		if (!file.path || !file.revOrigPath) {
-			callback();
+			cb();
 			return;
 		}
 
-		const revisionedFile = relativePath(path.resolve(file.cwd, file.base), path.resolve(file.cwd, file.path));
+		const revisionedFile = relPath(path.resolve(file.cwd, file.base), path.resolve(file.cwd, file.path));
 		const originalFile = path.join(path.dirname(revisionedFile), path.basename(file.revOrigPath)).replace(/\\/g, '/');
 
-		manifest[originalFile] = revisionedFile;
+		if (opts.append){
+			// hash 以参数形式展现，充当版本号
+			manifest[originalFile] = originalFile + '?v=' + file.revHash;
+		}else{
+			manifest[originalFile] = revisionedFile;
+		}
 
-		callback();
-	}, function (callback) {
+
+		cb();
+	}, function (cb) {
 		// No need to write a manifest file if there's nothing to manifest
 		if (Object.keys(manifest).length === 0) {
-			callback();
+			cb();
 			return;
 		}
 
-		(async () => {
-			try {
-				const manifestFile = await getManifestFile(options);
+		getManifestFile(opts).then(manifestFile => {
+			if (opts.merge && !manifestFile.isNull()) {
+				let oldManifest = {};
 
-				if (options.merge && !manifestFile.isNull()) {
-					let oldManifest = {};
+				try {
+					oldManifest = opts.transformer.parse(manifestFile.contents.toString());
+				} catch (_) {}
 
-					try {
-						oldManifest = options.transformer.parse(manifestFile.contents.toString());
-					} catch (_) {}
-
-					manifest = Object.assign(oldManifest, manifest);
-				}
-
-				manifestFile.contents = Buffer.from(options.transformer.stringify(sortKeys(manifest), undefined, '  '));
-				this.push(manifestFile);
-				callback();
-			} catch (error) {
-				callback(error);
+				manifest = Object.assign(oldManifest, manifest);
 			}
-		})();
+
+			manifestFile.contents = Buffer.from(opts.transformer.stringify(sortKeys(manifest), null, '  '));
+			this.push(manifestFile);
+			cb();
+		}).catch(cb);
 	});
 };
 
