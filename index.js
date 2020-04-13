@@ -80,7 +80,7 @@ const plugin = (opts) => {
 		const oldPath = file.path;
 		transformFilename(file);
 		pathMap[oldPath] = file.revHash;
-		if (opts.appCodeName){
+		if (opts.append){
 			// 仅保留文件名，文件名中不加hash
 			file.path = revPath.revert(file.path,file.revHash);
 		}
